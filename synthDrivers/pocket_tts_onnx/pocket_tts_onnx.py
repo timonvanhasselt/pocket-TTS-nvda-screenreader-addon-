@@ -86,6 +86,7 @@ class PocketTTSOnnx:
         device: str = "auto",
         temperature: float = 0.7,
         lsd_steps: int = 10,
+        eos_threshold: float = -2.0,
     ):
         self.models_dir = Path(models_dir)
 
@@ -95,6 +96,13 @@ class PocketTTSOnnx:
         self.precision = precision
         self.temperature = temperature
         self.lsd_steps = lsd_steps
+        # EOS threshold: logit above this value triggers end-of-speech detection.
+        # -4.0 (original) fires too early on long sentences — the model briefly
+        # considers stopping at any noun that could end a clause. -2.0 requires
+        # a stronger signal and matches the behaviour of the official PyTorch API
+        # default. Raise toward 0.0 for shorter pauses; lower toward -4.0 if
+        # the model clips the last word of short utterances.
+        self.eos_threshold = eos_threshold
 
         # Setup execution providers
         self.providers = self._get_providers(device)
@@ -203,8 +211,18 @@ class PocketTTSOnnx:
             if "step" in k:
                 state[k] = (state[k] + n).astype(np.int64)
 
+    # Maximum audio duration (seconds) passed to the voice encoder.
+    # The mimi encoder runs on the full audio array at once; very long
+    # samples (> ~60 s) can exhaust memory on low-RAM machines.
+    # 30 s is more than enough for a high-quality voice embedding.
+    MAX_VOICE_SECONDS = 30
+
     def _load_audio(self, path: Union[str, Path]) -> np.ndarray:
-        """Load and preprocess audio file for voice cloning."""
+        """Load and preprocess audio file for voice cloning.
+
+        Audio is truncated to MAX_VOICE_SECONDS before encoding to prevent
+        OOM errors when large MP3/WAV samples are supplied.
+        """
         if not HAS_SOUNDFILE:
             raise ImportError("soundfile required for voice cloning. Install with: pip install soundfile")
 
@@ -213,15 +231,20 @@ class PocketTTSOnnx:
         if len(audio.shape) > 1:
             audio = audio.mean(axis=1)
 
+        # Truncate to MAX_VOICE_SECONDS *before* resampling to keep the
+        # source array small.
+        max_source_samples = int(self.MAX_VOICE_SECONDS * sr)
+        if len(audio) > max_source_samples:
+            audio = audio[:max_source_samples]
+
         # Resample to 24kHz if needed
         if sr != self.SAMPLE_RATE:
             if HAS_SCIPY:
                 num_samples = int(len(audio) * self.SAMPLE_RATE / sr)
                 audio = scipy.signal.resample(audio, num_samples)
             else:
-                # Fallback to Numpy linear interpolation for resampling (No Scipy needed)
-                duration = len(audio) / sr
-                num_samples = int(duration * self.SAMPLE_RATE)
+                # Fallback: numpy linear interpolation (no scipy required)
+                num_samples = int(len(audio) * self.SAMPLE_RATE / sr)
                 old_indices = np.linspace(0, len(audio) - 1, len(audio))
                 new_indices = np.linspace(0, len(audio) - 1, num_samples)
                 audio = np.interp(new_indices, old_indices, audio)
@@ -278,20 +301,46 @@ class PocketTTSOnnx:
         self._voice_cache[voice_str] = embeddings
         return embeddings
 
+    # Phonetic expansions for single letters, matching how a screen reader
+    # would expect them to sound when read in isolation.
+    _LETTER_NAMES = {
+        'a': 'ay', 'b': 'bee', 'c': 'see', 'd': 'dee', 'e': 'ee',
+        'f': 'ef', 'g': 'gee', 'h': 'aitch', 'i': 'eye', 'j': 'jay',
+        'k': 'kay', 'l': 'el', 'm': 'em', 'n': 'en', 'o': 'oh',
+        'p': 'pee', 'q': 'cue', 'r': 'ar', 's': 'ess', 't': 'tee',
+        'u': 'you', 'v': 'vee', 'w': 'double-you', 'x': 'ex',
+        'y': 'why', 'z': 'zee',
+    }
+
     def _tokenize(self, text: str) -> np.ndarray:
-        """Tokenize text for the model."""
-        # Prepare text
+        """Tokenize text for the model, with special handling for single characters."""
         text = text.strip()
         if not text:
             raise ValueError("Text cannot be empty")
 
-        # Ensure proper punctuation
-        if text[-1].isalnum():
-            text = text + "."
-        if not text[0].isupper():
-            text = text[0].upper() + text[1:]
+        # Single character: expand to phonetic name so the TTS pronounces
+        # the letter correctly instead of guessing from a bare "S." etc.
+        if len(text) == 1:
+            letter = text.lower()
+            if letter in self._LETTER_NAMES:
+                text = self._LETTER_NAMES[letter].capitalize() + "."
+            elif letter.isdigit():
+                # Digits are fine as-is; the model handles them.
+                text = text + "."
+            else:
+                text = text + "."
+        else:
+            # Multi-character: apply light normalisation only.
+            # Add terminal punctuation when the last printable character is
+            # alphanumeric (prevents abrupt cut-off at end of utterance).
+            if text[-1].isalnum():
+                text = text + "."
+            # Do NOT force capitalisation. NVDA sometimes passes mid-sentence
+            # fragments (e.g. "her notifications") as separate speak() calls.
+            # Capitalising them makes the model treat them as new sentences,
+            # resetting prosody and causing unnatural stress patterns.
+            # The model handles lower-case sentence starts fine.
 
-        # Tokenize
         token_ids = self.tokenizer.Encode(text)
         return np.array(token_ids, dtype=np.int64).reshape(1, -1)
 
@@ -308,7 +357,7 @@ class PocketTTSOnnx:
         voice_embeddings: np.ndarray,
         text_ids: np.ndarray,
         max_frames: int = 500,
-        frames_after_eos: int = 3,
+        frames_after_eos: int = 1,
     ) -> Generator[np.ndarray, None, None]:
         """
         Run flow LM autoregressive generation, yielding latents.
@@ -369,7 +418,7 @@ class PocketTTSOnnx:
             self._update_state_from_outputs(state, res_step, self.flow_lm_main)
 
             # Check EOS - record when EOS is first detected
-            if eos_logit[0][0] > -4.0 and eos_step is None:
+            if eos_logit[0][0] > self.eos_threshold and eos_step is None:
                 eos_step = step
             
             # Stop only after frames_after_eos additional frames
@@ -430,7 +479,7 @@ class PocketTTSOnnx:
         self,
         text: str,
         voice: Union[str, Path, np.ndarray],
-        max_frames: int = 500,
+        max_frames: int = 1500,
     ) -> np.ndarray:
         """
         Generate audio from text (offline/batch mode).
@@ -471,7 +520,7 @@ class PocketTTSOnnx:
         self,
         text: str,
         voice: Union[str, Path, np.ndarray],
-        max_frames: int = 500,
+        max_frames: int = 1500,
         first_chunk_frames: int = 2,
         target_buffer_sec: float = 0.2,
         max_chunk_frames: int = 15,
@@ -505,19 +554,31 @@ class PocketTTSOnnx:
         playback_start_time = None
         start_time = time.time()
 
+        def _decode_chunk(size):
+            nonlocal decoded_frames, mimi_state, playback_start_time
+            chunk = np.concatenate(
+                generated_latents[decoded_frames:decoded_frames + size], axis=1
+            )
+            res = self.mimi_decoder.run(None, {"latent": chunk, **mimi_state})
+            audio = res[0].squeeze()
+            for k, val in enumerate(res[1:]):
+                mimi_state[f"state_{k}"] = val
+            decoded_frames += size
+            if playback_start_time is None:
+                playback_start_time = time.time() - start_time
+            return audio
+
         for latent in self._run_flow_lm(voice_emb, text_ids, max_frames):
             generated_latents.append(latent)
             pending = len(generated_latents) - decoded_frames
 
-            # Decide chunk size
             chunk_size = 0
 
             if playback_start_time is None:
-                # First chunk - minimize TTFB
+                # First chunk - minimise TTFB
                 if pending >= first_chunk_frames:
                     chunk_size = first_chunk_frames
             else:
-                # Calculate buffer status
                 elapsed = time.time() - start_time
                 audio_decoded_sec = decoded_frames * self.FRAME_DURATION
                 playback_elapsed = elapsed - playback_start_time
@@ -527,37 +588,18 @@ class PocketTTSOnnx:
                     # Buffer low - decode small chunk quickly
                     chunk_size = min(pending, 3)
                 elif pending >= max_chunk_frames:
-                    # Enough accumulated - decode larger chunk
                     chunk_size = max_chunk_frames
 
-            # Decode chunk if needed
             if chunk_size > 0:
-                latents_chunk = np.concatenate(
-                    generated_latents[decoded_frames:decoded_frames + chunk_size],
-                    axis=1
-                )
+                yield _decode_chunk(chunk_size)
 
-                res = self.mimi_decoder.run(None, {"latent": latents_chunk, **mimi_state})
-                audio_chunk = res[0].squeeze()
-
-                for k, val in enumerate(res[1:]):
-                    mimi_state[f"state_{k}"] = val
-
-                decoded_frames += chunk_size
-
-                if playback_start_time is None:
-                    playback_start_time = time.time() - start_time
-
-                yield audio_chunk
-
-        # Decode remaining latents
-        if decoded_frames < len(generated_latents):
-            remaining_latents = np.concatenate(
-                generated_latents[decoded_frames:],
-                axis=1
-            )
-            res = self.mimi_decoder.run(None, {"latent": remaining_latents, **mimi_state})
-            yield res[0].squeeze()
+        # Flush ALL remaining latents after generation ends.
+        # Critical: if max_frames was hit, or EOS fired just before a chunk
+        # boundary, any pending latents would be silently dropped without this,
+        # causing mid-sentence cut-off.
+        remaining = len(generated_latents) - decoded_frames
+        if remaining > 0:
+            yield _decode_chunk(remaining)
 
     def save_audio(self, audio: np.ndarray, path: Union[str, Path]):
         """Save audio to file."""
@@ -579,5 +621,6 @@ class PocketTTSOnnx:
             f"precision={self.precision!r}, "
             f"temperature={self.temperature}, "
             f"lsd_steps={self.lsd_steps}, "
+            f"eos_threshold={self.eos_threshold}, "
             f"sample_rate={self.SAMPLE_RATE})"
         )
