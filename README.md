@@ -5,3 +5,4 @@ Proof of concept NVDA screenreader 2026.1 addon for Pocket TTS from [Kyutai-labs
 * Option to clone a voice in the add-on (based on a wav or mp3)
 * Using the int8 versions of the model to be so memory efficient as possible
 
+Disclaimer: This addon is fully software engineered with AI, Claude.ai and Google Gemini. It's been manually tested in every step of the development in NVDA screenreader 2026, until it was ready for real user testing. 
